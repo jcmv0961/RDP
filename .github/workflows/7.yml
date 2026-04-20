@@ -1,0 +1,178 @@
+name: RDP Setup & Tailscale Deployment
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+
+    steps:
+      # ===================================================
+      # 🟢 1. CONFIGURAR AJUSTES DE RDP
+      # ===================================================
+      - name: Configure Core RDP Settings
+        run: |
+          echo "-------------------------------------------------"
+          echo "⚙️ CONFIGURANDO AJUSTES DE RDP EN UBUNTU..."
+          echo "-------------------------------------------------"
+
+          # 🌟 PASO CLAVE 1: Instalación del servicio XRDP 
+          echo "📦 Instalando o asegurando la instalación de XRDP..."
+          sudo apt update
+          sudo apt install -y xrdp
+
+          # 🌟 PASO CLAVE 2: Recarga la configuración de systemd
+          sudo systemctl daemon-reload 
+
+          # 🌟 PASO CLAVE 3: VERIFICACIÓN CRÍTICA
+          if [ -f /lib/systemd/system/xrdp.service ]; then
+              echo "✅ ARCHIVO XRDP.SERVICE ENCONTRADO. Procediendo..."
+              
+              # 2. Habilitar y reiniciar RDP
+              sudo systemctl enable xrdp
+              sudo systemctl restart xrdp
+              echo "✅ Servicio XRDP iniciado y habilitado."
+
+              # 3. Configuración de XRDP
+              echo "authgepts=true" | sudo tee /etc/xrdp/xrdp.ini > /dev/null
+              sudo sed -i 's/Port=3389/Port=3389/' /etc/xrdp/xrdp.ini
+
+              # 4. Firewall (UFW) - CORREGIDO
+              echo "⚙️ Configurando reglas de Firewall (UFW)..."
+              
+              # Eliminar la regla antigua
+              sudo ufw delete allow 3389/tcp 2>/dev/null || true
+              
+              # Añadir la regla RDP
+              sudo ufw allow 3389/tcp comment 'RDP-Tailscale'
+              if [ $? -ne 0 ]; then
+                  echo "❌ CRÍTICO: FALLÓ AL AÑADIR LA REGLA RDP en UFW!"
+                  exit 1
+              fi
+              
+              # Habilitar UFW (sin -t nat)
+              sudo ufw enable -y
+              if [ $? -ne 0 ]; then
+                  echo "❌ CRÍTICO: FALLÓ AL ACTIVAR UFW!"
+                  exit 1
+              fi
+              
+              # Verificar que la regla esté allí
+              sudo ufw status | grep "3389/tcp"
+              if [ $? -ne 0 ]; then
+                  echo "❌ CRÍTICO: LA REGLA 3389/tcp NO APARECE EN UFW."
+                  exit 1
+              fi
+              
+              echo "✅ Ajustes de RDP configurados correctamente."
+          else
+              echo "================================================="
+              echo "❌ FATAL ERROR: Unit file 'xrdp.service' NO encontrado."
+              echo "================================================="
+              exit 1 
+          fi
+
+      # ===================================================
+      # 🟢 2. CREAR USUARIO RDP CON CONTRASENA SEGURA
+      # ===================================================
+      - name: Create RDP User with Secure Password
+        run: |
+          echo "-------------------------------------------------"
+          echo "🔑 CREANDO USUARIO RDP..."
+          echo "-------------------------------------------------"
+          
+          PASSWORD=$(openssl rand -base64 16 | tr -d '/=+' | head -c 20)
+          
+          # Crear usuario sin grupo especial
+          sudo useradd -m -s /bin/bash rdpuser 2>/dev/null || true
+          
+          # Establecer contraseña
+          echo "rdpuser:$PASSWORD" | sudo chpasswd
+
+          if ! id "rdpuser" &>/dev/null; then
+              echo "❌ ERROR: Creación de usuario RDP fallida"
+              exit 1
+          else
+              echo "✅ Usuario RDP creado exitosamente."
+              # Guardar credenciales en variables de entorno
+              echo "RDP_USER=rdpuser" >> $GITHUB_ENV
+              echo "RDP_PASSWORD=$PASSWORD" >> $GITHUB_ENV
+              echo "RDP_CREDS=User: rdpuser | Password: $PASSWORD" >> $GITHUB_ENV
+          fi
+
+      # ===================================================
+      # 🟢 3. INSTALAR TAILSCALE
+      # ===================================================
+      - name: Install Tailscale
+        run: |
+          echo "-------------------------------------------------"
+          echo "📦 INSTALANDO TAILSCALE..."
+          echo "-------------------------------------------------"
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/focal.gpg | sudo gpg --dearmor -o /usr/share/keyrings/tailscale-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu focal main" | sudo tee /etc/apt/sources.list.d/tailscale.list
+          sudo apt update
+          sudo apt install -y tailscale
+          echo "✅ Tailscale instalado."
+
+      # ===================================================
+      # 🟢 4. ESTABLECER CONEXIÓN TAILSCALE
+      # ===================================================
+      - name: Establish Tailscale Connection
+        run: |
+          echo "-------------------------------------------------"
+          echo "🌐 ESTABLECIENDO CONEXIÓN TAILSCALE..."
+          echo "-------------------------------------------------"
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-${{ github.run_id }}
+          
+          TS_IP=""
+          RETRIES=0
+          MAX_RETRIES=10
+          while [ -z "$TS_IP" ] && [ $RETRIES -lt $MAX_RETRIES ]; do
+              TS_IP=$(sudo tailscale ip -4)
+              sleep 5
+              RETRIES=$((RETRIES + 1))
+          done
+          
+          if [ -z "$TS_IP" ]; then
+              echo "❌ ERROR: IP de Tailscale no asignada."
+              exit 1
+          else
+              echo "✅ IP de Tailscale asignada: $TS_IP"
+              echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+          fi
+
+      # ===================================================
+      # 🟢 5. VERIFICAR ACCESIBILIDAD RDP
+      # ===================================================
+      - name: Verify RDP Accessibility
+        run: |
+          echo "-------------------------------------------------"
+          echo "✅ VERIFICANDO ACCESIBILIDAD RDP..."
+          echo "-------------------------------------------------"
+          sudo systemctl status xrdp
+          sleep 2
+          if sudo netstat -tuln | grep 3389; then
+              echo "✅ Puerto 3389 escuchando correctamente."
+          else
+              echo "❌ ERROR: Puerto 3389 no está escuchando."
+              exit 1
+          fi
+
+      # ===================================================
+      # 🟢 6. MANTENER LA CONEXIÓN ACTIVA
+      # ===================================================
+      - name: Maintain Connection
+        run: |
+          echo "================================================="
+          echo "✨ DESPLIEGUE COMPLETADO: RDP READY ✨"
+          echo "================================================="
+          echo "📍 Dirección Tailscale: ${{ env.TAILSCALE_IP }}"
+          echo "👤 Usuario: ${{ env.RDP_USER }}"
+          echo "🔑 Contraseña: ${{ env.RDP_PASSWORD }}"
+          echo "=================================================\n"
+          
+          while true; do
+              echo "[$(date)] RDP Activo - Usa Ctrl+C en el flujo de trabajo para terminar"
+              sleep 300
+          done
