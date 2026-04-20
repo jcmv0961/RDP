@@ -1,0 +1,170 @@
+name: RDP Setup & Tailscale Deployment
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+
+    steps:
+      # ===================================================
+      # 🟢 1. CONFIGURAR AJUSTES DE RDP
+      # ===================================================
+      - name: Configure Core RDP Settings
+        run: |
+          echo "-------------------------------------------------"
+          echo "CONFIGURANDO AJUSTES DE RDP EN UBUNTU..."
+          echo "-------------------------------------------------"
+
+          # Instalación XRDP
+          echo "Instalando XRDP..."
+          sudo apt update
+          sudo apt install -y xrdp
+
+          sudo systemctl daemon-reload
+
+          # Verificación crítica
+          if [ -f /lib/systemd/system/xrdp.service ]; then
+              echo "XRDP instalado correctamente"
+
+              sudo systemctl enable xrdp
+              sudo systemctl restart xrdp
+              echo "Servicio XRDP iniciado"
+
+              # Configuración básica
+              echo "authgepts=true" | sudo tee -a /etc/xrdp/xrdp.ini > /dev/null
+              sudo sed -i 's/Port=.*/Port=3389/' /etc/xrdp/xrdp.ini || true
+
+              # Firewall
+              echo "Configurando UFW..."
+
+              sudo ufw delete allow 3389/tcp 2>/dev/null || true
+
+              sudo ufw allow 3389/tcp comment 'RDP-Tailscale'
+              if [ $? -ne 0 ]; then
+                  echo "CRÍTICO: fallo al abrir puerto 3389"
+                  exit 1
+              fi
+
+              # Verificación
+              if ! sudo ufw status | grep -q "3389/tcp"; then
+                  echo "CRÍTICO: regla 3389 no aplicada"
+                  sudo ufw status
+                  exit 1
+              fi
+
+              echo "Ajustes de RDP correctos"
+
+          else
+              echo "FATAL ERROR: xrdp.service no encontrado"
+              exit 1
+          fi
+
+      # ===================================================
+      # 🟢 2. CREAR USUARIO RDP
+      # ===================================================
+      - name: Create RDP User with Secure Password
+        run: |
+          echo "-------------------------------------------------"
+          echo "CREANDO USUARIO RDP..."
+          echo "-------------------------------------------------"
+
+          PASSWORD=$(openssl rand -base64 16 | tr -d /=+ | head -c 20)
+
+          sudo useradd -m -s /bin/bash RDP || true
+          sudo groupadd -f rdp
+          sudo usermod -aG rdp RDP
+
+          echo "RDP:$PASSWORD" | sudo chpasswd
+
+          if ! id "RDP" &>/dev/null; then
+              echo "ERROR: usuario RDP no creado"
+              exit 1
+          fi
+
+          echo "RDP_CREDS=User: RDP | Password: $PASSWORD" >> $GITHUB_ENV
+          echo "Usuario creado correctamente"
+
+      # ===================================================
+      # 🟢 3. INSTALAR TAILSCALE
+      # ===================================================
+      - name: Install Tailscale
+        run: |
+          echo "-------------------------------------------------"
+          echo "INSTALANDO TAILSCALE..."
+          echo "-------------------------------------------------"
+
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/focal.gpg \
+            | sudo gpg --dearmor -o /usr/share/keyrings/tailscale-archive-keyring.gpg
+
+          echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu focal main" \
+            | sudo tee /etc/apt/sources.list.d/tailscale.list
+
+          sudo apt update
+          sudo apt install -y tailscale
+
+          echo "Tailscale instalado"
+
+      # ===================================================
+      # 🟢 4. CONECTAR TAILSCALE
+      # ===================================================
+      - name: Establish Tailscale Connection
+        run: |
+          echo "-------------------------------------------------"
+          echo "CONECTANDO TAILSCALE..."
+          echo "-------------------------------------------------"
+
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-${{ github.run_id }}
+
+          TS_IP=""
+          RETRIES=0
+          MAX_RETRIES=10
+
+          while [ -z "$TS_IP" ] && [ $RETRIES -lt $MAX_RETRIES ]; do
+              TS_IP=$(sudo tailscale ip -4)
+              sleep 5
+              RETRIES=$((RETRIES + 1))
+          done
+
+          if [ -z "$TS_IP" ]; then
+              echo "ERROR: no se obtuvo IP de tailscale"
+              exit 1
+          fi
+
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+          echo "IP asignada: $TS_IP"
+
+      # ===================================================
+      # 🟢 5. VERIFICAR RDP
+      # ===================================================
+      - name: Verify RDP Accessibility
+        run: |
+          echo "-------------------------------------------------"
+          echo "VERIFICANDO RDP..."
+          echo "-------------------------------------------------"
+
+          if nc -zv $TAILSCALE_IP 3389; then
+              echo "RDP accesible"
+          else
+              echo "ERROR: puerto 3389 no responde"
+              exit 1
+          fi
+
+      # ===================================================
+      # 🟢 6. MANTENER SESIÓN
+      # ===================================================
+      - name: Maintain Connection
+        run: |
+          echo "================================================="
+          echo "RDP READY"
+          echo "================================================="
+          echo "IP: ${{ env.TAILSCALE_IP }}"
+          echo "Usuario: RDP"
+          echo "Credenciales: ${{ env.RDP_CREDS }}"
+          echo "================================================="
+
+          while true; do
+              echo "[$(date)] Runner activo"
+              sleep 300
+          done
