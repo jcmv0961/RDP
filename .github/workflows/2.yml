@@ -1,0 +1,162 @@
+name: RDP Setup & Tailscale Deployment
+# Se ejecuta manualmente desde la interfaz de GitHub Actions
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    # Se ejecuta en un entorno Ubuntu, ideal para Kali
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+
+    steps:
+      # ===================================================
+      # 🟢 1. CONFIGURAR AJUSTES DE RDP (¡CON LA SOLUCIÓN APLICADA!)
+      # ===================================================
+      - name: Configure Core RDP Settings
+        run: |
+          echo "-------------------------------------------------"
+          echo "⚙️ CONFIGURANDO AJUSTES DE RDP EN UBUNTU..."
+          echo "-------------------------------------------------"
+
+          # 🛑 SOLUCIÓN: Recarga la configuración de systemd para que reconozca el servicio 'xrdp' recién instalado.
+          sudo systemctl daemon-reload 
+
+          # 1. Habilitar y reiniciar RDP (El servicio de XRDP)
+          sudo systemctl enable xrdp
+          sudo systemctl restart xrdp
+          
+          echo "✅ Servicio XRDP iniciado y habilitado."
+
+          # 2. Deshabilitar autenticación de nivel de red (similar a SecurityLayer 0 en Windows)
+          # Esto se configura en el archivo de configuración de XRDP
+          echo "authgepts=true" | sudo tee /etc/xrdp/xrdp.ini > /dev/null
+
+          # 3. Permitir conexiones (similar a fDenyTSConnections 0 en Windows)
+          # Asegurar que el servicio XRDP esté escuchando en 0.0.0.0:3389
+          sudo sed -i 's/Port=3389/Port=3389/' /etc/xrdp/xrdp.ini
+
+          # 4. Firewall (UFW) - Eliminar y Añadir la regla de RDP
+          echo "⚙️ Configurando reglas de Firewall (UFW)..."
+          sudo ufw delete allow RDP-Tailscale 2>/dev/null || true # Eliminar regla si existe
+          sudo ufw allow 3389/tcp comment 'RDP-Tailscale' # Añadir regla
+          
+          sudo ufw enable -t nat # Asegurar que el NAT esté habilitado para el routing
+          sudo ufw status | grep "3389/tcp"
+          
+          echo "✅ Ajustes de RDP configurados correctamente."
+
+      # ===================================================
+      # 🟢 2. CREAR USUARIO RDP CON CONTRASENA SEGURA
+      # ===================================================
+      - name: Create RDP User with Secure Password
+        run: |
+          echo "-------------------------------------------------"
+          echo "🔑 CREANDO USUARIO RDP..."
+          echo "-------------------------------------------------"
+
+          # Generación de contraseña compleja (20 caracteres)
+          PASSWORD=$(openssl rand -base64 16 | tr -d /=+ | head -c 20)
+          
+          # Crear el usuario (y agregarlo al grupo 'rdp')
+          sudo useradd -m -s /bin/bash RDP
+          sudo usermod -aG rdp RDP # Añade al grupo 'rdp'
+          # Asignar contraseña
+          echo "$RDP:$PASSWORD" | sudo chpasswd
+
+          # Verificación
+          if ! id "RDP" &>/dev/null; then
+              echo "❌ ERROR: Creación de usuario RDP fallida"
+              exit 1
+          else
+              echo "✅ Usuario RDP creado exitosamente."
+          fi
+          
+          # Guarda las credenciales en las variables de entorno del workflow
+          echo "RDP_CREDS=User: RDP | Password: $PASSWORD" >> $GITHUB_ENV
+
+      # ===================================================
+      # 🟢 3. INSTALAR TAILSCALE
+      # ===================================================
+      - name: Install Tailscale
+        run: |
+          echo "-------------------------------------------------"
+          echo "📦 INSTALANDO TAILSCALE..."
+          echo "-------------------------------------------------"
+          # Añadir repositorio oficial de Tailscale
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/focal.gpg | sudo gpg --dearmor -o /usr/share/keyrings/tailscale-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu focal main" | sudo tee /etc/apt/sources.list.d/tailscale.list
+          
+          # Actualizar e instalar
+          sudo apt update
+          sudo apt install -y tailscale
+          
+          echo "✅ Tailscale instalado."
+
+      # ===================================================
+      # 🟢 4. ESTABLECER CONEXIÓN TAILSCALE
+      # ===================================================
+      - name: Establish Tailscale Connection
+        run: |
+          echo "-------------------------------------------------"
+          echo "🌐 ESTABLECIENDO CONEXIÓN TAILSCALE..."
+          echo "-------------------------------------------------"
+          
+          # Ejecutar Tailscale con la clave de autenticación y hostname
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-${{ github.run_id }}
+          
+          # Esperar a que se asigne una IP
+          TS_IP=""
+          RETRIES=0
+          MAX_RETRIES=10
+          while [ -z "$TS_IP" ] && [ $RETRIES -lt $MAX_RETRIES ]; do
+              # Obtener la IP IPv4
+              TS_IP=$(sudo tailscale ip -4)
+              sleep 5
+              RETRIES=$((RETRIES + 1))
+          done
+          
+          if [ -z "$TS_IP" ]; then
+              echo "❌ ERROR: IP de Tailscale no asignada después de $MAX_RETRIES intentos. Saliendo."
+              exit 1
+          else
+              echo "✅ IP de Tailscale asignada: $TS_IP"
+              echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+          fi
+
+      # ===================================================
+      # 🟢 5. VERIFICAR ACCESIBILIDAD DE RDP
+      # ===================================================
+      - name: Verify RDP Accessibility
+        run: |
+          echo "-------------------------------------------------"
+          echo "✅ VERIFICANDO ACCESIBILIDAD RDP..."
+          echo "-------------------------------------------------"
+          
+          # Usar 'nc' (netcat) para verificar conexión TCP
+          if nc -zv $TAILSCALE_IP 3389; then
+              echo "✅ Conectividad TCP exitosa al puerto 3389!"
+          else
+              echo "❌ ERROR: Falló la conexión TCP al puerto 3389. ¡Revisa el Firewall/RDP!"
+              exit 1
+          fi
+
+      # ===================================================
+      # 🟢 6. MANTENER CONEXIÓN (Mantener el runner activo)
+      # ===================================================
+      - name: Maintain Connection
+        run: |
+          echo "================================================="
+          echo "✨ DESPLIEGUE COMPLETADO: RDP READY ✨"
+          echo "================================================="
+          echo "📍 Dirección Tailscale: $TAILSCALE_IP"
+          echo "👤 Usuario: RDP"
+          echo "🔑 Contraseña: ${{ env.RDP_CREDS }}"
+          echo "=================================================\n"
+          
+          # Mantiene el runner activo indefinidamente
+          while true; do
+              echo "[$(date)] RDP Activo - Usa Ctrl+C en el flujo de trabajo para terminar"
+              sleep 300
+          done
+
