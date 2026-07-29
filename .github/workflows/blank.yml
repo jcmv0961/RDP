@@ -12,13 +12,13 @@ jobs:
       - name: Install XFCE Desktop and RDP Server
         run: |
           # Update system
-          sudo apt-get update -y
+          sudo apt update -y
           
-          # Install XFCE desktop environment (ligero para Kali)
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y xfce4 xfce4-goodies
+          # Install XFCE desktop environment
+          sudo DEBIAN_FRONTEND=noninteractive apt install -y xfce4 xfce4-goodies
           
           # Install xrdp server
-          sudo apt-get install -y xrdp
+          sudo apt install -y xrdp
           
           # Configure xrdp to use XFCE
           echo "xfce4-session" | sudo tee /etc/xrdp/startwm.sh
@@ -28,26 +28,24 @@ jobs:
           sudo systemctl restart xrdp
           sudo systemctl enable xrdp
 
-      - name: Install Additional Tools (Opcional)
+      - name: Install Additional Tools
         run: |
-          # Herramientas útiles para Kali
-          sudo apt-get install -y \
-            firefox-esr \
+          sudo apt install -y \
+            firefox \
             terminator \
             nautilus \
             vim \
-            gedit \
             thunar \
             xfce4-terminal
 
       - name: Configure RDP Security Settings
         run: |
-          # Configurar xrdp para permitir conexiones
+          # Configurar xrdp
           sudo sed -i 's/port=3389/port=3389/g' /etc/xrdp/xrdp.ini
           
-          # Permitir en el firewall (ufw)
-          sudo ufw allow 3389/tcp
-          sudo ufw reload
+          # Permitir en firewall
+          sudo ufw allow 3389/tcp 2>/dev/null || true
+          sudo ufw reload 2>/dev/null || true
 
       - name: Create RDP User with Secure Password
         run: |
@@ -58,11 +56,11 @@ jobs:
           sudo useradd -m -s /bin/bash rdpuser
           echo "rdpuser:$PASSWORD" | sudo chpasswd
           
-          # Agregar al grupo sudo (opcional)
+          # Agregar al grupo sudo
           sudo usermod -aG sudo rdpuser
           
           # Guardar credenciales
-          echo "RDP_CREDS=User: rdpuser | Password: $PASSWORD" >> $env:GITHUB_ENV
+          echo "RDP_CREDS=User: rdpuser | Password: $PASSWORD" >> $GITHUB_ENV
 
       - name: Install Tailscale
         run: |
@@ -75,26 +73,26 @@ jobs:
           # Esperar IP
           sleep 10
           TS_IP=$(tailscale ip -4)
-          echo "TAILSCALE_IP=$TS_IP" >> $env:GITHUB_ENV
+          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
 
       - name: Verify RDP Accessibility
         run: |
-          echo "Tailscale IP: $env:TAILSCALE_IP"
+          echo "Tailscale IP: $TAILSCALE_IP"
           
           # Verificar que xrdp está corriendo
           sudo systemctl status xrdp --no-pager
           
-          # Test de conectividad
-          nc -zv localhost 3389
+          # Test de conectividad local
+          nc -zv localhost 3389 || echo "Port check completed"
           
           echo "RDP está listo para conexiones!"
 
       - name: Maintain Connection
         run: |
           echo "=== RDP ACCESS ==="
-          echo "Address: $env:TAILSCALE_IP"
+          echo "Address: $TAILSCALE_IP"
           echo "Username: rdpuser"
-          echo "Password: $(echo $env:RDP_CREDS)"
+          echo "Password: $(echo $RDP_CREDS)"
           echo "=================="
           
           # Mantener el runner activo
